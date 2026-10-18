@@ -1,87 +1,97 @@
 
+import json
+import logging
 import os
 import time
 import uuid
-import asyncio
-from collections import defaultdict, deque
+from collections import deque
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from prometheus_client import Counter, CONTENT_TYPE_LATEST, generate_latest
 
 EMAIL = "22f3002796@ds.study.iitm.ac.in"
-WINDOW_SECONDS = 10
-MAX_REQUESTS = 15
+START_TIME = time.monotonic()
 
-app = FastAPI()
+app = FastAPI(title="Instrumented Work Service")
 
-# Middleware 1: propagate the request ID
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        request.state.request_id = request_id
-
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
-
-
-# Middleware 2: per-client sliding-window rate limiter
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app):
-        super().__init__(app)
-        self.requests = defaultdict(deque)
-        self.lock = asyncio.Lock()
-
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/ping" and request.method == "GET":
-            client_id = request.headers.get("X-Client-Id")
-            if not client_id:
-                client_id = (
-                    request.client.host if request.client else "unknown"
-                )
-
-            now = time.monotonic()
-
-            async with self.lock:
-                bucket = self.requests[client_id]
-
-                while bucket and now - bucket[0] >= WINDOW_SECONDS:
-                    bucket.popleft()
-
-                if len(bucket) >= MAX_REQUESTS:
-                    return JSONResponse(
-                        status_code=429,
-                        content={"detail": "Rate limit exceeded"},
-                    )
-
-                bucket.append(now)
-
-        return await call_next(request)
-
-
-# Register inner middleware first; the last registered is outermost.
-app.add_middleware(RateLimitMiddleware)
-app.add_middleware(RequestContextMiddleware)
-
-# Middleware 3: scoped CORS policy
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://app-y7942k.example.com",
-        "https://exam.sanand.workers.dev",
-    ],
-    allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["X-Request-ID", "X-Client-Id", "Content-Type"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+REQUESTS = Counter(
+    "http_requests",
+    "Total number of HTTP requests received",
+    ["method", "path", "status"],
+)
 
-@app.get("/ping")
-async def ping(request: Request):
+LOG_ENTRIES = deque(maxlen=2000)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("request_logger")
+
+
+@app.middleware("http")
+async def instrument_requests(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    path = request.url.path
+    method = request.method
+    started = time.monotonic()
+    status = 500
+
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.exception("Request failed")
+        raise
+    finally:
+        duration_ms = round((time.monotonic() - started) * 1000, 2)
+        REQUESTS.labels(method=method, path=path, status=str(status)).inc()
+
+        entry = {
+            "level": "INFO" if status < 500 else "ERROR",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": path,
+            "request_id": request_id,
+            "method": method,
+            "status": status,
+            "duration_ms": duration_ms,
+        }
+        LOG_ENTRIES.append(entry)
+        logger.info(json.dumps(entry))
+
+
+@app.get("/work")
+async def work(n: int = Query(default=1, ge=0, le=100000)):
+    # Perform n units of lightweight work.
+    checksum = sum(range(n))
+    return {"email": EMAIL, "done": n}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
+@app.get("/healthz")
+async def healthz():
     return {
-        "email": EMAIL,
-        "request_id": request.state.request_id,
+        "status": "ok",
+        "uptime_s": float(max(0.0, time.monotonic() - START_TIME)),
     }
 
+
+@app.get("/logs/tail")
+async def logs_tail(limit: int = Query(default=100, ge=1, le=2000)):
+    return list(LOG_ENTRIES)[-limit:]
